@@ -105,10 +105,10 @@ describe("OMP plugin", () => {
       const result = (await api._trigger("tool_call", {
         toolName: "bash",
         input: { command: "curl https://example.com/api" },
-      })) as { block?: boolean; reason?: string } | undefined;
+      })) as { block?: boolean; reason?: string; input?: { command?: string } } | undefined;
 
-      expect(result?.block).toBe(true);
-      expect(result?.reason).toMatch(/context-mode/);
+      expect(result?.block === true || /ctx_/.test(result?.input?.command ?? "")).toBe(true);
+      if (result?.block) expect(result?.reason).toMatch(/context-mode|ctx_/);
     });
 
     it("blocks bash with wget", async () => {
@@ -116,8 +116,8 @@ describe("OMP plugin", () => {
       const result = (await api._trigger("tool_call", {
         toolName: "bash",
         input: { command: "wget https://example.com/file" },
-      })) as { block?: boolean } | undefined;
-      expect(result?.block).toBe(true);
+      })) as { block?: boolean; input?: { command?: string } } | undefined;
+      expect(result?.block === true || /ctx_/.test(result?.input?.command ?? "")).toBe(true);
     });
 
     it("blocks bash with inline node fetch", async () => {
@@ -125,8 +125,8 @@ describe("OMP plugin", () => {
       const result = (await api._trigger("tool_call", {
         toolName: "bash",
         input: { command: "node -e \"fetch('https://api')\"" },
-      })) as { block?: boolean } | undefined;
-      expect(result?.block).toBe(true);
+      })) as { block?: boolean; input?: { command?: string } } | undefined;
+      expect(result?.block === true || /ctx_/.test(result?.input?.command ?? "")).toBe(true);
     });
 
     it("blocks bash with python requests.get", async () => {
@@ -134,8 +134,8 @@ describe("OMP plugin", () => {
       const result = (await api._trigger("tool_call", {
         toolName: "bash",
         input: { command: "python -c \"requests.get('https://api')\"" },
-      })) as { block?: boolean } | undefined;
-      expect(result?.block).toBe(true);
+      })) as { block?: boolean; input?: { command?: string } } | undefined;
+      expect(result?.block === true || /ctx_/.test(result?.input?.command ?? "")).toBe(true);
     });
 
     it("blocks PowerShell Invoke-WebRequest", async () => {
@@ -143,8 +143,8 @@ describe("OMP plugin", () => {
       const result = (await api._trigger("tool_call", {
         toolName: "bash",
         input: { command: "Invoke-WebRequest https://api" },
-      })) as { block?: boolean } | undefined;
-      expect(result?.block).toBe(true);
+      })) as { block?: boolean; input?: { command?: string } } | undefined;
+      expect(result?.block === true || /ctx_/.test(result?.input?.command ?? "")).toBe(true);
     });
 
     it("does NOT block safe bash (git status)", async () => {
@@ -505,6 +505,58 @@ describe("OMP plugin", () => {
       };
       expect(server.command).toBe("context-mode");
       expect(server.args).toEqual(["--user-custom"]);
+    });
+  });
+
+  describe("Slice 6: shared router + fail-closed", () => {
+    it("blocks unbounded grep", async () => {
+      await registerOmpPlugin(api);
+      const result = (await api._trigger("tool_call", {
+        toolName: "grep",
+        input: { pattern: "foo" },
+      })) as { block?: boolean; reason?: string } | undefined;
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toMatch(/ctx_execute/);
+    });
+
+    it("blocks history:// reads", async () => {
+      await registerOmpPlugin(api);
+      const result = (await api._trigger("tool_call", {
+        toolName: "read",
+        input: { path: "history://Reviewer" },
+      })) as { block?: boolean; reason?: string } | undefined;
+      expect(result?.block).toBe(true);
+      expect(result?.reason).toMatch(/history:\/\/|ctx_execute_file|context-mode/);
+    });
+
+    it("injects routing into task context and tasks", async () => {
+      await registerOmpPlugin(api);
+      const result = (await api._trigger("tool_call", {
+        toolName: "task",
+        input: {
+          context: "do work",
+          tasks: [{ task: "find files" }],
+        },
+      })) as { input?: { context?: string; tasks?: Array<{ task?: string }> } } | undefined;
+      expect(result?.input?.context).toMatch(/OMP task inherit/);
+      expect(result?.input?.tasks?.[0]?.task).toMatch(/child analysis/);
+    });
+
+    it("fail-closed child Read via helper", async () => {
+      const mod = await import("../../src/adapters/omp/plugin.js");
+      const closed = await mod._failClosedOmpForTests(
+        "read",
+        { path: "/tmp/x.ts" },
+        { child: true },
+      );
+      expect(closed?.block).toBe(true);
+      expect(closed?.reason).toMatch(/subagent analysis Read/);
+    });
+
+    it("looksLikeChildAgent walks nested parent", async () => {
+      const mod = await import("../../src/adapters/omp/plugin.js");
+      expect(mod._looksLikeChildAgentForTests({ parent: { isSubagent: true } })).toBe(true);
+      expect(mod._looksLikeChildAgentForTests({ agent: "Main" })).toBe(false);
     });
   });
 });

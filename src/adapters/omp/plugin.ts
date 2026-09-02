@@ -1,13 +1,10 @@
 /**
  * Oh My Pi (OMP) plugin entry point for context-mode.
  *
- * Mirrors the Pi extension shape (`src/adapters/pi/extension.ts`) for
- * the four OMP hook events that materially protect the context window
- * and persist session continuity:
- *
- *   - session_start         — initialize the session row in our DB
- *   - tool_call             — hard-block curl/wget/inline-HTTP in bash
- *   - tool_result           — extract structured events into the session DB
+ *   - session_start          — initialize the session row in our DB
+ *   - tool_call              — shared routePreToolUse (Claude PreToolUse)
+ *   - context                — inject queued routing guidance
+ *   - tool_result            — extract structured events into the session DB
  *   - session_before_compact — persist a resume snapshot before compaction
  *
  * Loaded by OMP via the `omp` (or `pi`) field in package.json — see
@@ -25,9 +22,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { resolveSessionDbPath, SessionDB } from "../../session/db.js";
 import { extractEvents, buildAgentUsageEvent } from "../../session/extract.js";
@@ -37,55 +34,409 @@ import type { SessionEvent } from "../../types.js";
 import { OMPAdapter } from "./index.js";
 import { parseOmpUsage } from "./usage.js";
 
-// ── Tool-name normalization ─────────────────────────────
-// OMP uses lowercase tool names (refs/.../hooks/types.ts:451 example
-// `toolName: "bash"`). Shared event extractors expect PascalCase
-// (Claude Code convention). Map the common ones.
 const OMP_TOOL_MAP: Record<string, string> = {
   bash: "Bash",
   edit: "Edit",
   read: "Read",
   write: "Write",
   list: "Glob",
+  glob: "Glob",
+  grep: "Grep",
   view: "Read",
+  task: "Agent",
+  eval: "Bash",
 };
 
-// ── Routing patterns ─────────────────────────────────────
-// Inline HTTP client patterns to hard-block in bash. Identical to the
-// Pi extension list (src/adapters/pi/extension.ts:42). One unrouted
-// curl can dump 56 KB into context.
-const BLOCKED_BASH_PATTERNS: RegExp[] = [
-  /\bcurl\s/,
-  /\bwget\s/,
-  /\bfetch\s*\(/,
-  /\brequests\.get\s*\(/,
-  /\brequests\.post\s*\(/,
-  /\bhttp\.get\s*\(/,
-  /\bhttp\.request\s*\(/,
-  /\burllib\.request/,
-  /\bInvoke-WebRequest\b/,
-];
-
-// ── Module-level singletons ──────────────────────────────
-// Same shape as Pi: one DB per process, session ID rebound on each
-// session_start so multi-session reuse within a long-lived plugin
-// process keeps event attribution correct.
 let _db: SessionDB | null = null;
 let _dbPath = "";
 let _sessionId = "";
+let _pendingContext = "";
 
 const _ompAdapter = new OMPAdapter();
+const _pluginRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 
-// ── MCP self-registration (issue #677) ───────────────────
-// The `omp plugin install context-mode` path wires THIS extension factory
-// (so routing hooks fire), but never creates the MCP config — so the 11
-// `ctx_*` tools stay unreachable even though curl/wget are blocked. Register
-// the server ourselves on plugin load, ONLY when absent (never clobber a
-// user's existing entry). Takes effect on the next OMP restart, same as the
-// manual mcp.json workaround the issue documents.
+if (process.env.CONTEXT_MODE_ASSUME_MCP_READY !== "0") {
+  process.env.CONTEXT_MODE_ASSUME_MCP_READY = "1";
+}
+
+type Decision = {
+  action: string;
+  reason?: string;
+  updatedInput?: Record<string, unknown>;
+  additionalContext?: string;
+};
+
+type RoutingMods = {
+  routePreToolUse: (
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    projectDir?: string,
+    platform?: string,
+    sessionId?: string,
+    extra?: { mcpToolsAvailable?: boolean },
+  ) => Decision | null;
+  initSecurity: (root: string) => Promise<unknown>;
+  isStructurallyBounded: (command: string) => boolean;
+  createRoutingBlock: (
+    t: (bare: string) => string,
+    options?: { includeCommands?: boolean },
+  ) => string;
+  createToolNamer: (platform: string) => (bare: string) => string;
+};
+
+let _routing: RoutingMods | null = null;
+let _routingPromise: Promise<RoutingMods> | null = null;
+
+async function loadRouting(): Promise<RoutingMods> {
+  if (_routing) return _routing;
+  if (_routingPromise) return _routingPromise;
+  // hooks/ lives outside tsc rootDir (src/). Same pattern as OpenClaw plugin.
+  _routingPromise = (async () => {
+    const routing = await import(
+      pathToFileURL(resolve(_pluginRoot, "hooks/core/routing.mjs")).href
+    ) as RoutingMods & Record<string, unknown>;
+    const block = await import(
+      pathToFileURL(resolve(_pluginRoot, "hooks/routing-block.mjs")).href
+    ) as { createRoutingBlock: RoutingMods["createRoutingBlock"] };
+    const naming = await import(
+      pathToFileURL(resolve(_pluginRoot, "hooks/core/tool-naming.mjs")).href
+    ) as { createToolNamer: RoutingMods["createToolNamer"] };
+    await routing.initSecurity(resolve(_pluginRoot, "build")).catch(() => {});
+    _routing = {
+      routePreToolUse: routing.routePreToolUse,
+      initSecurity: routing.initSecurity,
+      isStructurallyBounded: routing.isStructurallyBounded,
+      createRoutingBlock: block.createRoutingBlock,
+      createToolNamer: naming.createToolNamer,
+    };
+    return _routing;
+  })();
+  return _routingPromise;
+}
+
+void loadRouting();
+
+function queueContext(text: string): void {
+  if (!text) return;
+  _pendingContext = _pendingContext ? `${_pendingContext}\n\n${text}` : text;
+}
+
+function unwrapOmpBashCommand(command: string): string {
+  let s = String(command ?? "").trim();
+  for (let i = 0; i < 4; i++) {
+    const next = s
+      .replace(/^(?:rtk|timeout(?:\s+\d+(?:\.\d+)?)?)\s+/i, "")
+      .trim();
+    if (next === s) break;
+    s = next;
+  }
+  return s;
+}
+
+function prepareToolInput(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+): Record<string, unknown> {
+  const name = String(toolName).toLowerCase();
+  if (name === "eval") {
+    const lang = String(toolInput.language ?? "");
+    const code = String(toolInput.code ?? "");
+    if (
+      (lang === "js" || lang === "javascript" || lang === "ts" || lang === "typescript") &&
+      /\bfetch\s*\(/.test(code)
+    ) {
+      return { command: code };
+    }
+    return toolInput;
+  }
+  if (name === "bash" && typeof toolInput.command === "string") {
+    const unwrapped = unwrapOmpBashCommand(toolInput.command);
+    if (unwrapped !== toolInput.command) {
+      return { ...toolInput, command: unwrapped };
+    }
+  }
+  return toolInput;
+}
+
+const OMP_TASK_MARKER = "context-mode: OMP task inherit";
+const OMP_CHILD_ANALYSIS_MARKER = "context-mode: child analysis";
+const OMP_FAIL_CLOSED_REASON =
+  "context-mode: use ctx_execute / ctx_execute_file / ctx_batch_execute — native tool would dump into context.";
+const OMP_CHILD_READ_REASON =
+  "context-mode: subagent analysis Read blocked. Use ctx_execute_file / ctx_execute — native Read dumps source into context.";
+const OMP_TRANSCRIPT_REASON =
+  "context-mode: history:// and agent:// dump child transcripts into context. Use the yielded JSON or hub send.";
+const OMP_FAT_MCP_REASON =
+  "context-mode: this MCP payload dumps into context. Use ctx_execute (glab / codegraph explore) and console.log only findings.";
+const FAT_MCP_WRITE =
+  /mcp__(?:gitlab_get_mr_discussions|gitlab_get_merge_request_diffs|codegraph_explore)\b/i;
+
+function injectOmpTaskRouting(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  routing: RoutingMods,
+): Record<string, unknown> {
+  if (String(toolName).toLowerCase() !== "task" || !toolInput) return toolInput;
+  const already = (s: unknown) => typeof s === "string" && s.includes(OMP_TASK_MARKER);
+  const tasks = toolInput.tasks;
+  if (already(toolInput.context) && (!Array.isArray(tasks) || tasks.every((t) => already((t as { task?: unknown })?.task)))) {
+    return toolInput;
+  }
+  const block =
+    "\n\n<!-- " + OMP_TASK_MARKER + " -->\n" +
+    routing.createRoutingBlock(routing.createToolNamer("omp"), { includeCommands: false }) +
+    "\n<!-- " + OMP_CHILD_ANALYSIS_MARKER + " -->\n" +
+    "FORBIDDEN on this subagent: native Read, Grep, unbounded bash, history://, agent://, codegraph_explore, gitlab get_mr_discussions / get_merge_request_diffs. " +
+    "Use ctx_execute_file / ctx_execute / ctx_batch_execute. Yield JSON findings only. Native Read is for Edit on the parent, not here.\n";
+  const next: Record<string, unknown> = { ...toolInput };
+  if (typeof next.context === "string" && !already(next.context)) {
+    next.context = next.context + block;
+  }
+  if (Array.isArray(tasks)) {
+    next.tasks = tasks.map((item) => {
+      if (!item || typeof item !== "object") return item;
+      const rec = item as Record<string, unknown>;
+      if (typeof rec.task !== "string" || already(rec.task)) return item;
+      return { ...rec, task: rec.task + block };
+    });
+  }
+  return next;
+}
+
+function readPath(input: Record<string, unknown> | undefined): string {
+  return String(input?.path ?? input?.file_path ?? "").trim();
+}
+
+function isSandboxInternalUri(p: string): boolean {
+  return /^(skill|xd|artifact|local|memory):\/\//i.test(p);
+}
+
+function isTranscriptUri(p: string): boolean {
+  return /^(history|agent):\/\//i.test(p);
+}
+
+function isInternalUri(p: string): boolean {
+  return isSandboxInternalUri(p) || isTranscriptUri(p) || /^ssh:\/\//i.test(p);
+}
+
+function isLargeRead(input: Record<string, unknown> | undefined): boolean {
+  const p = readPath(input);
+  if (!p || isInternalUri(p)) return false;
+  try {
+    const st = statSync(p);
+    return st.isFile() && st.size > 50_000;
+  } catch {
+    return false;
+  }
+}
+
+function fatMcpWrite(input: Record<string, unknown> | undefined): boolean {
+  return FAT_MCP_WRITE.test(readPath(input));
+}
+
+function looksLikeChildAgent(...roots: unknown[]): boolean {
+  const seen = new Set<object>();
+  function walk(obj: unknown, depth: number): boolean {
+    if (!obj || typeof obj !== "object" || depth > 4) return false;
+    if (seen.has(obj)) return false;
+    seen.add(obj);
+    const rec = obj as Record<string, unknown>;
+    if (rec.parentToolCallId || rec.subagentEventBus || rec.isSubagent === true) return true;
+    const agent = rec.agent ?? rec.agentName ?? rec.agentId;
+    if (typeof agent === "string" && agent.length > 0 && !/^main$/i.test(agent)) return true;
+    return walk(rec.runner, depth + 1)
+      || walk(rec.parent, depth + 1)
+      || walk(rec.context, depth + 1)
+      || walk(rec.toolCall, depth + 1)
+      || walk(rec.subagentEventBus, depth + 1);
+  }
+  return roots.some((root) => walk(root, 0));
+}
+
+function isChildExecuteContext(wrapper: unknown, context: unknown): boolean {
+  const runner = (wrapper as { runner?: { hasHandlers?: (name: string) => boolean } } | undefined)?.runner;
+  if (!runner?.hasHandlers?.("tool_call")) return true;
+  return looksLikeChildAgent(wrapper, context, (context as { toolCall?: unknown } | undefined)?.toolCall);
+}
+
+type OmpToolResult = { block?: boolean; reason?: string; input?: Record<string, unknown> };
+
+function decisionToOmpResult(
+  decision: Decision | null,
+  event: { toolName?: string; input?: Record<string, unknown> },
+  routing: RoutingMods,
+): OmpToolResult | undefined {
+  if (!decision) return undefined;
+  if (decision.action === "deny") {
+    return { block: true, reason: decision.reason || "Blocked by context-mode" };
+  }
+  if (decision.action === "modify" && decision.updatedInput && typeof decision.updatedInput === "object") {
+    return { input: { ...(event?.input ?? {}), ...decision.updatedInput } };
+  }
+  if (decision.action === "context" && decision.additionalContext) {
+    const tool = String(event?.toolName ?? "").toLowerCase();
+    const input = (event?.input && typeof event.input === "object") ? event.input : {};
+    if (tool === "read" || tool === "view") {
+      if (isLargeRead(input) || isTranscriptUri(readPath(input))) {
+        return { block: true, reason: decision.additionalContext };
+      }
+      queueContext(decision.additionalContext);
+      return undefined;
+    }
+    if (tool === "grep") return { block: true, reason: decision.additionalContext };
+    if (tool === "bash") {
+      const cmd = String(input.command ?? "");
+      if (routing.isStructurallyBounded(cmd)) return undefined;
+      return { block: true, reason: decision.additionalContext };
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
+function failClosedOmp(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  opts: { child?: boolean } = {},
+  routing: RoutingMods,
+): OmpToolResult | undefined {
+  const tool = String(toolName ?? "").toLowerCase();
+  const child = opts.child === true;
+  if (tool === "grep") return { block: true, reason: OMP_FAIL_CLOSED_REASON };
+  if (tool === "read" || tool === "view") {
+    const p = readPath(input);
+    if (isTranscriptUri(p)) return { block: true, reason: OMP_TRANSCRIPT_REASON };
+    if (child && p && !isSandboxInternalUri(p)) return { block: true, reason: OMP_CHILD_READ_REASON };
+    if (isLargeRead(input)) return { block: true, reason: OMP_FAIL_CLOSED_REASON };
+    return undefined;
+  }
+  if (tool === "write" && fatMcpWrite(input)) return { block: true, reason: OMP_FAT_MCP_REASON };
+  if (tool === "bash") {
+    const cmd = String(input?.command ?? "");
+    if (!cmd || routing.isStructurallyBounded(cmd)) return undefined;
+    return { block: true, reason: OMP_FAIL_CLOSED_REASON };
+  }
+  return undefined;
+}
+
+async function routeOmpToolCall(
+  toolName: string,
+  rawInput: unknown,
+  rawEvent: unknown,
+  rawCtx: unknown,
+): Promise<OmpToolResult | undefined> {
+  const routing = await loadRouting();
+  const toolInput0 = (rawInput && typeof rawInput === "object")
+    ? rawInput as Record<string, unknown>
+    : {};
+  const prepared = prepareToolInput(toolName, toolInput0);
+  const routedName = prepared !== toolInput0 && String(toolName).toLowerCase() === "eval" ? "bash" : toolName;
+  let toolInput = prepared;
+  let event = { toolName, input: toolInput };
+  if (String(toolName).toLowerCase() === "task") {
+    toolInput = injectOmpTaskRouting(toolName, toolInput, routing);
+    event = { toolName, input: toolInput };
+  }
+  const decision = routing.routePreToolUse(
+    routedName,
+    toolInput,
+    process.env.PI_PROJECT_DIR || process.cwd(),
+    "omp",
+    _sessionId,
+    { mcpToolsAvailable: true },
+  );
+  const mapped = decisionToOmpResult(decision, event, routing);
+  if (mapped?.block || mapped?.input) {
+    if (String(toolName).toLowerCase() === "task" && mapped.input) {
+      return { ...mapped, input: injectOmpTaskRouting(toolName, mapped.input, routing) };
+    }
+    return mapped;
+  }
+  if (String(toolName).toLowerCase() === "task") return { input: toolInput };
+  const child = (rawEvent as { child?: boolean } | undefined)?.child === true
+    || looksLikeChildAgent(rawEvent, rawCtx);
+  const closed = failClosedOmp(
+    routedName === "bash" && String(toolName).toLowerCase() === "eval" ? "bash" : toolName,
+    toolInput,
+    { child },
+    routing,
+  );
+  if (closed) return closed;
+  if (prepared !== toolInput0) return { input: prepared };
+  return mapped;
+}
+
+type WrapperInstance = {
+  name?: string;
+  tool?: { name?: string };
+  runner?: { hasHandlers?: (n: string) => boolean };
+};
+type WrapperExecute = ((
+  this: unknown,
+  toolCallId: unknown,
+  params: unknown,
+  signal: unknown,
+  onUpdate: unknown,
+  context: unknown,
+) => Promise<unknown>) & { __cmGate?: boolean };
+type WrapperCtor = { prototype: { execute: WrapperExecute } };
+
+function resolveExtensionToolWrapper(api: unknown): WrapperCtor | null {
+  const rec = api as { pi?: { ExtensionToolWrapper?: WrapperCtor } } | null;
+  const pi = rec?.pi;
+  if (typeof pi?.ExtensionToolWrapper?.prototype?.execute === "function") {
+    return pi.ExtensionToolWrapper;
+  }
+  if (!api || typeof api !== "object") return null;
+  for (const v of Object.values(api as Record<string, unknown>)) {
+    const ctor = v as WrapperCtor;
+    if (typeof v === "function" && v.name === "ExtensionToolWrapper" && typeof ctor.prototype?.execute === "function") {
+      return ctor;
+    }
+  }
+  return null;
+}
+
+function installRestrictedChildExecuteGate(api: unknown): void {
+  const Ctor = resolveExtensionToolWrapper(api);
+  if (!Ctor?.prototype?.execute || Ctor.prototype.execute.__cmGate) return;
+  const orig = Ctor.prototype.execute;
+  const gated: WrapperExecute = async function gated(
+    this: unknown,
+    toolCallId: unknown,
+    params: unknown,
+    signal: unknown,
+    onUpdate: unknown,
+    context: unknown,
+  ): Promise<unknown> {
+    const self = this as WrapperInstance;
+    try {
+      const toolName = self.name || self.tool?.name || "";
+      const child = isChildExecuteContext(self, context);
+      const routing = await loadRouting();
+      const closed = failClosedOmp(
+        toolName,
+        (params && typeof params === "object") ? params as Record<string, unknown> : {},
+        { child },
+        routing,
+      );
+      if (closed?.block) throw new Error(closed.reason);
+      if (!self.runner?.hasHandlers?.("tool_call")) {
+        const mapped = await routeOmpToolCall(toolName, params, { child: true }, context);
+        if (mapped?.block) throw new Error(mapped.reason || "Blocked by context-mode");
+        if (mapped?.input) params = mapped.input;
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/context-mode|Blocked by/i.test(msg)) throw err;
+    }
+    return orig.call(this, toolCallId, params, signal, onUpdate, context);
+  };
+  gated.__cmGate = true;
+  Ctor.prototype.execute = gated;
+}
+
 const MCP_SERVER_NAME = "context-mode";
-// plugin.js ships at <pkg>/build/adapters/omp/plugin.js; the MCP server
-// bundle sits at the package root (<pkg>/server.bundle.mjs) — three up.
 const SERVER_BUNDLE_RELATIVE = "../../../server.bundle.mjs";
 
 function resolveServerBundle(): string | null {
@@ -98,29 +449,21 @@ function resolveServerBundle(): string | null {
   }
 }
 
-/**
- * Ensure `~/.omp/agent/mcp.json` registers the context-mode MCP server.
- *
- * Uses `node <abs>/server.bundle.mjs` rather than the `context-mode` bin:
- * under the plugin install the package lives in `~/.omp/plugins/node_modules`
- * and its bin is NOT on PATH, so the bare command would fail to spawn (the
- * exact symptom reported on issue #677). Best effort — never throws, never
- * breaks plugin load.
- */
 function ensureMcpServerRegistered(): void {
   try {
     const bundle = resolveServerBundle();
-    if (!bundle) return; // bundle missing → nothing safe to register
+    if (!bundle) return;
 
     const settings = _ompAdapter.readSettings() ?? {};
     const mcpServers =
       (settings.mcpServers as Record<string, unknown> | undefined) ?? {};
-    if (MCP_SERVER_NAME in mcpServers) return; // already present — don't clobber
+    if (MCP_SERVER_NAME in mcpServers) return;
 
     mcpServers[MCP_SERVER_NAME] = {
       type: "stdio",
       command: "node",
       args: [bundle],
+      env: { CONTEXT_MODE_PLATFORM: "omp" },
     };
     settings.mcpServers = mcpServers;
     _ompAdapter.writeSettings(settings as Record<string, unknown>);
@@ -135,22 +478,11 @@ function getSessionDir(): string {
   return dir;
 }
 
-// Issue #645 — route through the canonical per-project resolver the MCP
-// server uses (src/server.ts ctx_stats / ctx_search timeline). The
-// previous shared `context-mode.db` literal was a different file from
-// the `<canonical-hash>.db` the server reads, so every OMP user's
-// `ctx_stats` reported zero history and `ctx_search(sort: "timeline")`
-// silently dropped the sort. Mirrors the matching Pi fix and the
-// opencode plugin pattern (src/adapters/opencode/plugin.ts:307).
 function getDBPath(projectDir: string): string {
   return resolveSessionDbPath({ projectDir, sessionsDir: getSessionDir() });
 }
 
 function getOrCreateDB(projectDir: string): SessionDB {
-  // Reopen the singleton if the resolved DB path changes. See the
-  // matching Pi extension comment — defensive re-keying on projectDir
-  // hash keeps tests deterministic and stops a stale singleton from
-  // pointing at an earlier projectDir's `<hash>.db`. (#645)
   const dbPath = getDBPath(projectDir);
   if (!_db || _dbPath !== dbPath) {
     if (_db) {
@@ -162,12 +494,6 @@ function getOrCreateDB(projectDir: string): SessionDB {
   return _db;
 }
 
-/**
- * Derive a stable session ID from OMP's session manager when available,
- * otherwise fall back to a wall-clock token. Mirrors the Pi extension
- * derivation (src/adapters/pi/extension.ts:142) — the OMP `ctx` object
- * exposes `sessionManager.getSessionFile()` per refs/.../hooks/types.ts.
- */
 function deriveSessionId(ctx: Record<string, unknown> | undefined): string {
   try {
     const sessionManager = (ctx as { sessionManager?: { getSessionFile?: () => string } } | undefined)
@@ -182,9 +508,6 @@ function deriveSessionId(ctx: Record<string, unknown> | undefined): string {
   return `omp-${Date.now()}`;
 }
 
-// ── Test-only state reset (NOT exported via plugin entry) ───────────
-// The plugin's default export is the OMP factory; this helper is only
-// imported by tests to clear singletons between cases.
 export function _resetOmpPluginStateForTests(): void {
   if (_db) {
     try { _db.close(); } catch { /* best effort */ }
@@ -192,24 +515,25 @@ export function _resetOmpPluginStateForTests(): void {
   _db = null;
   _dbPath = "";
   _sessionId = "";
+  _pendingContext = "";
 }
 
-/**
- * Return the current session ID picked by the most recent session_start
- * handler. Test-only — production code reads `_sessionId` directly via
- * the closure. The shared SQLite DB at `~/.omp/context-mode/` survives
- * between tests, so `getLatestSessionId()` cannot disambiguate which
- * row belongs to "this" test when multiple tests insert in the same
- * second; tests use this getter instead.
- */
 export function _getOmpPluginSessionIdForTests(): string {
   return _sessionId;
 }
 
-// ── HookAPI shape (local declaration; type erased at runtime) ──────
-// We deliberately do NOT take a hard dependency on
-// @oh-my-pi/pi-coding-agent. The runtime shape below mirrors the
-// upstream HookAPI signature at refs/.../hooks/types.ts:695.
+export async function _failClosedOmpForTests(
+  toolName: string,
+  input: Record<string, unknown> | undefined,
+  opts?: { child?: boolean },
+): Promise<OmpToolResult | undefined> {
+  return failClosedOmp(toolName, input, opts, await loadRouting());
+}
+
+export function _looksLikeChildAgentForTests(...roots: unknown[]): boolean {
+  return looksLikeChildAgent(...roots);
+}
+
 type ToolCallEvent = { toolName: string; toolCallId?: string; input?: Record<string, unknown> };
 type ToolResultEvent = {
   toolName: string;
@@ -218,11 +542,7 @@ type ToolResultEvent = {
   content?: Array<{ type: string; text?: string }>;
   isError?: boolean;
 };
-type ToolCallEventResult = { block?: boolean; reason?: string };
-// turn_end / agent_end usage-bearing event. Shape is intentionally loose — the
-// pure parseOmpUsage() (usage.ts) does the null-safe field extraction. Refs:
-// AssistantMessage (refs/platforms/omp/packages/ai/src/types.ts:505-541),
-// Usage (refs/.../packages/catalog/src/types.ts:100-145).
+type ToolCallEventResult = { block?: boolean; reason?: string; input?: Record<string, unknown> };
 type TurnEndEvent = {
   type?: string;
   message?: unknown;
@@ -236,42 +556,25 @@ export interface MinimalHookAPI {
   on(event: "session_before_compact", handler: HookHandler<{ type: "session_before_compact" }>): void;
   on(event: "tool_call", handler: HookHandler<ToolCallEvent, ToolCallEventResult>): void;
   on(event: "tool_result", handler: HookHandler<ToolResultEvent>): void;
-  // turn_end carries a single per-turn AssistantMessage with `.usage`/`.model`
-  // (refs/.../extensibility/shared-events.ts:204-208). agent_end carries
-  // `messages: AssistantMessage[]` (:191-194) — both flow through parseOmpUsage.
   on(event: "turn_end", handler: HookHandler<TurnEndEvent>): void;
+  on(event: "context", handler: HookHandler<{ messages?: Array<{ role: string; content: string }> }, { messages: Array<{ role: string; content: string }> }>): void;
   on(event: string, handler: (...args: unknown[]) => unknown): void;
 }
 
-// ── Plugin entry point ───────────────────────────────────
-
-/**
- * OMP plugin default export. Called once by the OMP runtime per
- * upstream `extensibility/plugins/loader.ts` after `omp plugin install
- * context-mode`. Subsequent `pi.on(...)` registrations route the four
- * lifecycle events to our SessionDB-backed handlers below.
- */
 export default function ompPlugin(pi: MinimalHookAPI): void {
-  // OMP upstream uses PI_-prefixed env vars only (verified against
-  // can1357/oh-my-pi v3.20.1 — see `packages/utils/src/dirs.ts`). The
-  // earlier `OMP_PROJECT_DIR` read was an EM mistake — no upstream code
-  // ever sets it. Drop it; fall through PI_PROJECT_DIR → cwd().
   const projectDir = process.env.PI_PROJECT_DIR || process.cwd();
 
-  // Self-register the MCP server so `ctx_*` tools are reachable under the
-  // plugin install path, not just the manual MCP-only path (issue #677).
   ensureMcpServerRegistered();
+  installRestrictedChildExecuteGate(pi);
 
   const db = getOrCreateDB(projectDir);
 
-  // ── 1. session_start — initialize session row ─────────
   pi.on("session_start", (_event, ctx) => {
     try {
       _sessionId = deriveSessionId(ctx);
       db.ensureSession(_sessionId, projectDir);
       db.cleanupOldSessions(7);
     } catch {
-      // best effort — never break session start
       if (!_sessionId) {
         _sessionId = `omp-${Date.now()}`;
       }
@@ -279,37 +582,27 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
     return undefined;
   });
 
-  // ── 2. tool_call — pre-tool-call hard-block ───────────
-  // Returning `{block: true, reason}` per
-  // refs/.../hooks/types.ts:566 (ToolCallEventResult) terminates the
-  // tool call with the reason surfaced to the LLM.
-  pi.on("tool_call", (event) => {
+  pi.on("tool_call", async (event, ctx) => {
     try {
-      const toolName = String(event?.toolName ?? "").toLowerCase();
-      if (toolName !== "bash") return undefined;
-
-      const command = String((event?.input as { command?: unknown } | undefined)?.command ?? "");
-      if (!command) return undefined;
-
-      const isBlocked = BLOCKED_BASH_PATTERNS.some((p) => p.test(command));
-      if (isBlocked) {
-        return {
-          block: true,
-          reason:
-            "Use context-mode MCP tools (ctx_execute, ctx_fetch_and_index) instead of inline HTTP. " +
-            "curl/wget/fetch dump raw HTTP into the context window.",
-        };
-      }
+      return await routeOmpToolCall(String(event?.toolName ?? ""), event?.input, event, ctx);
     } catch {
-      // routing failure → allow passthrough
+      return undefined;
     }
-    return undefined;
   });
 
-  // ── 3. tool_result — post-tool-call event capture ─────
-  // OMP `tool_result` payload (refs/.../hooks/types.ts:461 onward) is
-  // `{toolName, toolCallId, input, content[], isError}`. We adapt to
-  // the Claude Code-shaped HookInput consumed by extractEvents.
+  pi.on("context", (event) => {
+    try {
+      if (!_pendingContext) return undefined;
+      const ctx = _pendingContext;
+      _pendingContext = "";
+      const messages = Array.isArray(event?.messages) ? event.messages : [];
+      messages.push({ role: "user", content: ctx });
+      return { messages };
+    } catch {
+      return undefined;
+    }
+  });
+
   pi.on("tool_result", (event) => {
     try {
       if (!_sessionId) return undefined;
@@ -340,7 +633,6 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
     return undefined;
   });
 
-  // ── 4. session_before_compact — resume snapshot ───────
   pi.on("session_before_compact", () => {
     try {
       if (!_sessionId) return undefined;
@@ -354,17 +646,6 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
     return undefined;
   });
 
-  // ── 5. turn_end — per-turn token + provider cost capture ──
-  // OMP exposes REAL per-turn tokens AND a provider-computed USD cost on the
-  // completed turn's AssistantMessage (`event.message.usage` / `.model`),
-  // delivered INCREMENTALLY per turn (matrix §2,§5). parseOmpUsage maps that to
-  // the buildAgentUsageEvent counts (Usage.cacheWrite→cache_creation,
-  // cacheRead→cache_read, cost.total→native_cost_usd). buildAgentUsageEvent
-  // prefers the native cost over the local price table and returns null on an
-  // all-zero turn. We persist via db.insertEvent — the SessionDB-backed forward
-  // path used everywhere in this in-process plugin runtime (the .mjs
-  // attributeAndInsertEvents helper is the Claude-hook analogue, not reachable
-  // here). Best-effort: a usage parse must never break the turn.
   pi.on("turn_end", (event) => {
     try {
       if (!_sessionId) return undefined;
@@ -379,3 +660,4 @@ export default function ompPlugin(pi: MinimalHookAPI): void {
     return undefined;
   });
 }
+
