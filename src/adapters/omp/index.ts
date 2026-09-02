@@ -13,10 +13,9 @@
  *     global `~/.omp/agent/SYSTEM.md` fallback). NOT `PI.md` — no `PI.md`
  *     loader exists upstream. OMP also auto-discovers `AGENTS.md` via
  *     `packages/coding-agent/src/discovery/agents-md.ts`.
- *   - Hook surface: OMP DOES expose pre/post tool-call hooks
- *     (`~/.omp/agent/hooks/{pre,post}/*.ts`, `omp.on("tool_call", ...)`).
- *     This adapter ships MCP-only delivery for now; wiring native OMP
- *     hooks is future work tracked separately.
+ *   - Hook surface: OMP plugin.js registers pi.on(tool_call|tool_result|
+ *     session_start|session_before_compact|context). Shared routePreToolUse
+ *     (Claude PreToolUse) runs in-process. No ~/.omp/hooks directory.
  *
  * Why a dedicated adapter rather than reusing pi:
  *   OMP and Pi share a runtime surface but different storage roots
@@ -61,40 +60,39 @@ export class OMPAdapter extends BaseAdapter implements HookAdapter {
   }
 
   readonly name = "OMP";
-  readonly paradigm: HookParadigm = "mcp-only";
+  readonly paradigm: HookParadigm = "ts-plugin";
 
   readonly capabilities: PlatformCapabilities = {
-    preToolUse: false,
-    postToolUse: false,
-    preCompact: false,
-    sessionStart: false,
-    canModifyArgs: false,
+    preToolUse: true,
+    postToolUse: true,
+    preCompact: true,
+    sessionStart: true,
+    canModifyArgs: true,
     canModifyOutput: false,
-    canInjectSessionContext: false,
+    canInjectSessionContext: true,
   };
 
-  // ── Input parsing ──────────────────────────────────────
-  // OMP does not support hooks. These methods exist to satisfy the
-  // interface contract but will throw if called.
+  // Stdin JSON hooks unused. In-process plugin.js owns routing.
 
   parsePreToolUseInput(_raw: unknown): PreToolUseEvent {
-    throw new Error("OMP hooks not wired by this adapter (MCP-only delivery)");
+    throw new Error("OMP uses in-process plugin.js, not stdin PreToolUse");
   }
 
   parsePostToolUseInput(_raw: unknown): PostToolUseEvent {
-    throw new Error("OMP hooks not wired by this adapter (MCP-only delivery)");
+    throw new Error("OMP uses in-process plugin.js, not stdin PreToolUse");
   }
 
   parsePreCompactInput(_raw: unknown): PreCompactEvent {
-    throw new Error("OMP hooks not wired by this adapter (MCP-only delivery)");
+    throw new Error("OMP uses in-process plugin.js, not stdin PreToolUse");
   }
 
   parseSessionStartInput(_raw: unknown): SessionStartEvent {
-    throw new Error("OMP hooks not wired by this adapter (MCP-only delivery)");
+    throw new Error("OMP uses in-process plugin.js, not stdin PreToolUse");
   }
 
+
   // ── Response formatting ────────────────────────────────
-  // OMP does not support hooks. Return undefined for all responses.
+  // Stdin hook responses unused. plugin.js returns {block, reason, input}.
 
   formatPreToolUseResponse(_response: PreToolUseResponse): unknown {
     return undefined;
@@ -168,10 +166,9 @@ export class OMPAdapter extends BaseAdapter implements HookAdapter {
     return [
       {
         check: "Hook support",
-        status: "warn",
+        status: "pass",
         message:
-          "context-mode delivers via MCP for OMP. " +
-          "Native OMP pre/post tool-call hooks are not yet wired by this adapter.",
+          "OMP plugin.js owns tool_call routing in-process via shared routePreToolUse.",
       },
     ];
   }
