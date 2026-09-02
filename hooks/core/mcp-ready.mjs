@@ -71,6 +71,7 @@ export function sentinelPath() {
  *   sentinel is trusted instead of being deleted.
  */
 export function isMCPReady() {
+  if (process.env.CONTEXT_MODE_ASSUME_MCP_READY === "1") return true;
   try {
     const dir = sentinelDir();
     const files = readdirSync(dir).filter(f => f.startsWith(SENTINEL_PREFIX));
